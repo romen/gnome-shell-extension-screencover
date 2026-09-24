@@ -156,6 +156,7 @@ class ScreenCoverIndicator extends PanelMenu.Button {
         super._init(0.0, 'Screen Cover');
         this._ext = ext;
         this._rows = new Map();
+        this._labelled = []; // connectors that get an on-screen label
         this._destroyed = false;
         this.connect('destroy', () => {
             this._destroyed = true;
@@ -177,10 +178,12 @@ class ScreenCoverIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._keepBarItem);
         this.menu.addAction('Clear all', () => this._ext.ClearAll());
 
-        // Rebuild the list every time the menu opens
+        // Rebuild the list every time the menu opens; labels only while open
         this.menu.connect('open-state-changed', (_menu, open) => {
             if (open)
                 this.refresh().catch(e => logError(e, 'ScreenCover'));
+            else
+                this.hideLabels();
         });
     }
 
@@ -197,16 +200,23 @@ class ScreenCoverIndicator extends PanelMenu.Button {
 
         this._section.removeAll();
         this._rows.clear();
+        this._labelled = [];
 
         if (connected.length === 0) {
             this._section.addMenuItem(new PopupMenu.PopupMenuItem(
                 'No connected outputs found', {reactive: false}));
             return;
         }
-        for (const connector of connected)
-            this._section.addMenuItem(this._makeRow(connector, details.get(connector)));
+        for (const connector of connected) {
+            const detail = details.get(connector);
+            if (detail)
+                this._labelled.push(connector); // only outputs GNOME can place a label on
+            this._section.addMenuItem(this._makeRow(connector, detail));
+        }
         this.sync();
         this.syncOptions();
+        if (this.menu.isOpen)
+            this.showLabels();
     }
 
     _makeRow(connector, detail) {
@@ -261,6 +271,19 @@ class ScreenCoverIndicator extends PanelMenu.Button {
     syncOptions() {
         this._keepBarItem.setToggleState(this._ext.keepTopBar);
     }
+
+    /** Show each output's connector name on its screen, like Settings does. */
+    showLabels() {
+        const params = {};
+        for (const connector of this._labelled)
+            params[connector] = new GLib.Variant('s', connector);
+        // The labeler tracks its caller by D-Bus name, so pass one that stays alive
+        Main.osdMonitorLabeler.show(Gio.DBus.session.get_unique_name(), params);
+    }
+
+    hideLabels() {
+        Main.osdMonitorLabeler.hide(Gio.DBus.session.get_unique_name());
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -290,6 +313,7 @@ export default class ScreenCoverExtension extends Extension {
     disable() {
         Main.layoutManager.disconnect(this._monitorsId);
         this.ClearAll();
+        this._indicator.hideLabels();
         this._indicator.destroy();
         this._indicator = null;
         this._dbus.unexport();
@@ -366,7 +390,7 @@ export default class ScreenCoverExtension extends Extension {
     async _freeze(connector, mon, delayMs) {
         const hadCover = this._covers.has(connector);
         this.Clear(connector);
-        // Give the stage time to repaint without the menu / old cover
+        // Give the stage time to repaint without the menu / labels / old cover
         const delay = Math.max(delayMs, hadCover ? 100 : 0);
         if (delay)
             await wait(delay);
@@ -389,14 +413,21 @@ export default class ScreenCoverExtension extends Extension {
         try {
             if (mode === 'freeze' && this.modeOf(connector) !== 'freeze') {
                 const mon = this._monitor(connector);
+                // Keep the label overlays out of the frozen image
+                this._indicator.hideLabels();
+                let delay = 100;
                 // The menu is on the primary monitor: close it first so it
-                // doesn't end up in the frozen image
-                let delay = 0;
+                // doesn't end up in the frozen image either
                 if (mon.index === Main.layoutManager.primaryIndex) {
                     this._indicator.menu.close();
                     delay = 300;
                 }
-                this._freeze(connector, mon, delay).catch(e => logError(e, 'ScreenCover'));
+                this._freeze(connector, mon, delay)
+                    .then(() => {
+                        if (this._indicator?.menu.isOpen)
+                            this._indicator.showLabels();
+                    })
+                    .catch(e => logError(e, 'ScreenCover'));
             } else {
                 this.Toggle(mode, connector);
             }
