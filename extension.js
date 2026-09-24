@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Nicola Tuveri <nicola@romen.dev>
 // SPDX-License-Identifier: Apache-2.0
 
+import GObject from 'gi://GObject';
+import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 import Clutter from 'gi://Clutter';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const IFACE = `
@@ -22,22 +26,238 @@ const IFACE = `
   </interface>
 </node>`;
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Connector names (e.g. "DP-2") that the kernel reports as connected. */
+function connectedOutputs() {
+    const names = new Set();
+    const decoder = new TextDecoder();
+    const children = Gio.File.new_for_path('/sys/class/drm').enumerate_children(
+        'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+
+    let info;
+    while ((info = children.next_file(null)) !== null) {
+        const entry = info.get_name();
+        const match = entry.match(/^card\d+-(.+)$/);
+        if (!match)
+            continue;
+        try {
+            const [, bytes] = GLib.file_get_contents(`/sys/class/drm/${entry}/status`);
+            if (decoder.decode(bytes).trim() === 'connected')
+                names.add(match[1]);
+        } catch (e) {
+            // No status file for this entry; skip it
+        }
+    }
+    children.close(null);
+
+    return [...names].sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
+}
+
+/**
+ * Vendor/product info per connector, from Mutter's DisplayConfig D-Bus API.
+ * Must be async: Mutter runs in this same process, a sync call would deadlock.
+ */
+function mutterMonitors() {
+    return new Promise((resolve, reject) => {
+        Gio.DBus.session.call(
+            'org.gnome.Mutter.DisplayConfig',
+            '/org/gnome/Mutter/DisplayConfig',
+            'org.gnome.Mutter.DisplayConfig',
+            'GetCurrentState',
+            null, null, Gio.DBusCallFlags.NONE, -1, null,
+            (conn, res) => {
+                try {
+                    const [, monitors] = conn.call_finish(res).recursiveUnpack();
+                    const map = new Map();
+                    for (const [[connector, vendor, product], , props] of monitors) {
+                        map.set(connector, {
+                            vendor,
+                            product,
+                            name: props['display-name'] || `${vendor} ${product}`,
+                        });
+                    }
+                    resolve(map);
+                } catch (e) {
+                    reject(e);
+                }
+            });
+    });
+}
+
+/** Capture the whole stage (all monitors) as a GPU texture. */
+function captureStage() {
+    const shooter = new Shell.Screenshot();
+    return new Promise((resolve, reject) => {
+        shooter.screenshot_stage_to_content((obj, res) => {
+            try {
+                const [content] = obj.screenshot_stage_to_content_finish(res);
+                resolve(content);
+            } catch (e) {
+                reject(e);
+            }
+        });
+    });
+}
+
+function wait(ms) {
+    return new Promise(resolve => {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        });
+    });
+}
+
+/** St.BoxLayout switched from `vertical` to `orientation` in GNOME 48. */
+function makeVertical(box) {
+    if ('orientation' in box)
+        box.orientation = Clutter.Orientation.VERTICAL;
+    else
+        box.vertical = true;
+}
+
+// ---------------------------------------------------------------------------
+// Top-bar indicator
+// ---------------------------------------------------------------------------
+
+const Indicator = GObject.registerClass(
+class ScreenCoverIndicator extends PanelMenu.Button {
+    _init(ext) {
+        super._init(0.0, 'Screen Cover');
+        this._ext = ext;
+        this._rows = new Map();
+        this._destroyed = false;
+        this.connect('destroy', () => {
+            this._destroyed = true;
+        });
+
+        this.add_child(new St.Icon({
+            icon_name: 'video-display-symbolic',
+            style_class: 'system-status-icon',
+        }));
+
+        this._section = new PopupMenu.PopupMenuSection();
+        this.menu.addMenuItem(this._section);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addAction('Clear all', () => this._ext.ClearAll());
+
+        // Rebuild the list every time the menu opens
+        this.menu.connect('open-state-changed', (_menu, open) => {
+            if (open)
+                this.refresh().catch(e => logError(e, 'ScreenCover'));
+        });
+    }
+
+    async refresh() {
+        const connected = connectedOutputs();
+        let details = new Map();
+        try {
+            details = await mutterMonitors();
+        } catch (e) {
+            logError(e, 'ScreenCover: GetCurrentState failed');
+        }
+        if (this._destroyed)
+            return;
+
+        this._section.removeAll();
+        this._rows.clear();
+
+        if (connected.length === 0) {
+            this._section.addMenuItem(new PopupMenu.PopupMenuItem(
+                'No connected outputs found', {reactive: false}));
+            return;
+        }
+        for (const connector of connected)
+            this._section.addMenuItem(this._makeRow(connector, details.get(connector)));
+        this.sync();
+    }
+
+    _makeRow(connector, detail) {
+        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+
+        const text = new St.BoxLayout({x_expand: true, y_align: Clutter.ActorAlign.CENTER});
+        makeVertical(text);
+        text.add_child(new St.Label({text: detail?.name ?? 'Unknown monitor'}));
+        text.add_child(new St.Label({
+            text: detail
+                ? `${connector} · ${detail.vendor} ${detail.product}`
+                : `${connector} · not active in GNOME`,
+            style: 'font-size: 0.85em;',
+        }));
+        item.add_child(text);
+
+        // Outputs Mutter doesn't know about can't be covered
+        const usable = Boolean(detail);
+        const makeButton = (label, mode) => {
+            const button = new St.Button({
+                label,
+                style_class: 'button',
+                style: 'margin-left: 6px;',
+                toggle_mode: true,
+                can_focus: usable,
+                reactive: usable,
+                opacity: usable ? 255 : 110,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            button.connect('clicked', () => this._ext.toggleFromMenu(mode, connector));
+            return button;
+        };
+
+        const black = makeButton('Black', 'black');
+        const freeze = makeButton('Freeze', 'freeze');
+        item.add_child(black);
+        item.add_child(freeze);
+        this._rows.set(connector, {black, freeze});
+        return item;
+    }
+
+    /** Make the toggle buttons reflect the actual cover state. */
+    sync() {
+        for (const [connector, {black, freeze}] of this._rows) {
+            const mode = this._ext.modeOf(connector);
+            black.checked = mode === 'black';
+            freeze.checked = mode === 'freeze';
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------
+
 export default class ScreenCoverExtension extends Extension {
     enable() {
-        this._covers = new Map();
+        this._covers = new Map(); // connector -> {actor, mode}
+
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
         this._dbus.export(Gio.DBus.session, '/dev/romen/ScreenCover');
+
+        this._indicator = new Indicator(this);
+        Main.panel.addToStatusArea(this.uuid, this._indicator);
+
         // Monitor layout changed -> geometry is stale, drop all covers
-        this._monitorsId = Main.layoutManager.connect('monitors-changed',
-            () => this.ClearAll());
+        this._monitorsId = Main.layoutManager.connect('monitors-changed', () => {
+            this.ClearAll();
+            if (this._indicator.menu.isOpen)
+                this._indicator.refresh().catch(e => logError(e, 'ScreenCover'));
+        });
     }
 
     disable() {
-        this.ClearAll();
         Main.layoutManager.disconnect(this._monitorsId);
+        this.ClearAll();
+        this._indicator.destroy();
+        this._indicator = null;
         this._dbus.unexport();
         this._dbus = null;
         this._covers = null;
+    }
+
+    modeOf(connector) {
+        return this._covers?.get(connector)?.mode ?? null;
     }
 
     _monitor(connector) {
@@ -48,47 +268,83 @@ export default class ScreenCoverExtension extends Extension {
         return Main.layoutManager.monitors[idx];
     }
 
-    _makeCover(connector, mon) {
-        const cover = new St.Widget({
+    _addCover(connector, mode, mon) {
+        const actor = new St.Widget({
             style: 'background-color: black;',
-            reactive: true,            // swallow clicks on this monitor
+            reactive: true, // swallow clicks on this monitor
             clip_to_allocation: true,
             x: mon.x, y: mon.y, width: mon.width, height: mon.height,
         });
-        Main.layoutManager.addTopChrome(cover, {affectsInputRegion: true});
-        this._covers.set(connector, cover);
-        return cover;
+        // Escape hatch: double-click a covered screen to uncover it
+        actor.connect('button-press-event', (_actor, event) => {
+            if (event.get_click_count() === 2)
+                this.Clear(connector);
+            return Clutter.EVENT_STOP;
+        });
+        Main.layoutManager.addTopChrome(actor, {affectsInputRegion: true});
+        this._covers.set(connector, {actor, mode});
+        this._indicator?.sync();
+        return actor;
     }
 
-    Black(connector) {
-        const mon = this._monitor(connector);
+    async _freeze(connector, mon, delayMs) {
+        const hadCover = this._covers.has(connector);
         this.Clear(connector);
-        this._makeCover(connector, mon);
-    }
+        // Give the stage time to repaint without the menu / old cover
+        const delay = Math.max(delayMs, hadCover ? 100 : 0);
+        if (delay)
+            await wait(delay);
 
-    Freeze(connector) {
-        const mon = this._monitor(connector);  // throw early for bad names
-        this._freeze(connector, mon).catch(e => logError(e, 'ScreenCover'));
-    }
+        const content = await captureStage();
+        if (!this._covers)
+            return; // disabled while waiting
 
-    async _freeze(connector, mon) {
         this.Clear(connector);
-        // Grab the whole stage as a GPU texture (no file, no portal)
-        const shooter = new Shell.Screenshot();
-        const [content] = await shooter.screenshot_stage_to_content();
-        if (!this._covers) return;  // disabled while we waited
-
-        const cover = this._makeCover(connector, mon);
-        // Show the full-stage image, offset so only this monitor's part is visible
-        cover.add_child(new Clutter.Actor({
+        const actor = this._addCover(connector, 'freeze', mon);
+        // Full-stage image, offset so only this monitor's part is visible
+        actor.add_child(new Clutter.Actor({
             content,
             x: -mon.x, y: -mon.y,
             width: global.stage.width, height: global.stage.height,
         }));
     }
 
+    toggleFromMenu(mode, connector) {
+        try {
+            if (mode === 'freeze' && this.modeOf(connector) !== 'freeze') {
+                const mon = this._monitor(connector);
+                // The menu is on the primary monitor: close it first so it
+                // doesn't end up in the frozen image
+                let delay = 0;
+                if (mon.index === Main.layoutManager.primaryIndex) {
+                    this._indicator.menu.close();
+                    delay = 300;
+                }
+                this._freeze(connector, mon, delay).catch(e => logError(e, 'ScreenCover'));
+            } else {
+                this.Toggle(mode, connector);
+            }
+        } catch (e) {
+            logError(e, 'ScreenCover');
+        }
+        this._indicator?.sync();
+    }
+
+    // ----- D-Bus methods -----
+
+    Black(connector) {
+        const mon = this._monitor(connector);
+        this.Clear(connector);
+        this._addCover(connector, 'black', mon);
+    }
+
+    Freeze(connector) {
+        const mon = this._monitor(connector); // throws early for bad names
+        this._freeze(connector, mon, 0).catch(e => logError(e, 'ScreenCover'));
+    }
+
     Toggle(mode, connector) {
-        if (this._covers.has(connector))
+        if (this.modeOf(connector) === mode)
             this.Clear(connector);
         else if (mode === 'freeze')
             this.Freeze(connector);
@@ -97,15 +353,19 @@ export default class ScreenCoverExtension extends Extension {
     }
 
     Clear(connector) {
-        const cover = this._covers.get(connector);
-        if (!cover) return;
-        Main.layoutManager.removeChrome(cover);
-        cover.destroy();
+        const cover = this._covers?.get(connector);
+        if (!cover)
+            return;
+        Main.layoutManager.removeChrome(cover.actor);
+        cover.actor.destroy();
         this._covers.delete(connector);
+        this._indicator?.sync();
     }
 
     ClearAll() {
-        for (const c of [...this._covers.keys()])
-            this.Clear(c);
+        if (!this._covers)
+            return;
+        for (const connector of [...this._covers.keys()])
+            this.Clear(connector);
     }
 }
