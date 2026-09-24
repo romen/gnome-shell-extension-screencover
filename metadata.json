@@ -1,0 +1,6 @@
+{
+  "uuid": "screencover@romen.dev",
+  "name": "Screen Cover",
+  "description": "Black out or freeze individual monitors",
+  "shell-version": ["45", "46", "47", "48", "49"]
+}
