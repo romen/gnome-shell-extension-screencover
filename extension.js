@@ -342,10 +342,17 @@ export default class ScreenCoverExtension extends Extension {
             clip_to_allocation: true,
             x: mon.x, y: mon.y, width: mon.width, height: mon.height,
         });
-        // Escape hatch: double-click a covered screen to uncover it
+
+        // Escape hatch: double-click a covered screen to uncover it.
+        // Clutter no longer counts clicks, so time the presses ourselves.
+        let lastPress = 0;
         actor.connect('button-press-event', (_actor, event) => {
-            if (event.get_click_count() === 2)
+            const now = event.get_time(); // milliseconds
+            const interval = Clutter.Settings.get_default().double_click_time || 400;
+            if (lastPress && now - lastPress <= interval)
                 this.Clear(connector);
+            else
+                lastPress = now;
             return Clutter.EVENT_STOP;
         });
 
