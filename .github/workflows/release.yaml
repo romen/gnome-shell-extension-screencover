@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'    # v1.2.3
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'  # v1.2.3-rc1 (published as a pre-release)
+
+permissions:
+  contents: write # needed to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check that the tag matches metadata.json
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $tag is not of the form v<major>.<minor>.<patch>[-<suffix>]"
+            exit 1
+          fi
+          tag_version="${tag#v}"   # v1.2.3 -> 1.2.3
+          meta_version=$(jq -r '.["version-name"] // empty' metadata.json)
+          if [ -z "$meta_version" ]; then
+            echo "::error file=metadata.json::metadata.json has no version-name"
+            exit 1
+          fi
+          if [ "$tag_version" != "$meta_version" ]; then
+            echo "::error file=metadata.json::Tag $tag does not match version-name \"$meta_version\" in metadata.json"
+            exit 1
+          fi
+          echo "Version $meta_version matches tag $tag"
+
+      - name: Install gnome-extensions
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-shell
+          command -v gnome-extensions
+
+      - name: Pack extension
+        run: |
+          gnome-extensions pack . --extra-source=LICENSE --force
+          zip_name="$(jq -r .uuid metadata.json).shell-extension.zip"
+          unzip -l "$zip_name"
+          echo "ZIP=$zip_name" >> "$GITHUB_ENV"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          flags=(--verify-tag --generate-notes --title "$tag")
+          [[ "$tag" == *-* ]] && flags+=(--prerelease)
+          gh release create "$tag" "$ZIP" "${flags[@]}"
