@@ -4,5 +4,5 @@
   "description": "Black out or freeze individual monitors",
   "shell-version": ["45", "46", "47", "48", "49"],
   "url": "https://github.com/romen/gnome-shell-extension-screencover",
-  "version-name": "0.1.0-alpha"
+  "version-name": "0.1.0"
 }
