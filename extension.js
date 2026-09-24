@@ -12,6 +12,8 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+const DBUS_PATH = '/dev/romen/ScreenCover';
+
 const IFACE = `
 <node>
   <interface name="dev.romen.ScreenCover">
@@ -23,6 +25,7 @@ const IFACE = `
     </method>
     <method name="Clear"><arg type="s" direction="in" name="connector"/></method>
     <method name="ClearAll"/>
+    <method name="SetKeepTopBar"><arg type="b" direction="in" name="keep"/></method>
   </interface>
 </node>`;
 
@@ -119,6 +122,30 @@ function makeVertical(box) {
         box.vertical = true;
 }
 
+/** Path of the config file: ~/.config/<uuid>/config.json */
+function configPath(uuid) {
+    return GLib.build_filenamev([GLib.get_user_config_dir(), uuid, 'config.json']);
+}
+
+function loadConfig(uuid) {
+    try {
+        const [, bytes] = GLib.file_get_contents(configPath(uuid));
+        return JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+        return {};
+    }
+}
+
+function saveConfig(uuid, config) {
+    try {
+        const path = configPath(uuid);
+        GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o755);
+        GLib.file_set_contents(path, JSON.stringify(config, null, 2));
+    } catch (e) {
+        logError(e, 'ScreenCover: saving config');
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-bar indicator
 // ---------------------------------------------------------------------------
@@ -141,7 +168,13 @@ class ScreenCoverIndicator extends PanelMenu.Button {
 
         this._section = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._section);
+
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._keepBarItem = new PopupMenu.PopupSwitchMenuItem(
+            'Keep top bar visible', this._ext.keepTopBar);
+        this._keepBarItem.connect('toggled',
+            (_item, state) => this._ext.setKeepTopBar(state));
+        this.menu.addMenuItem(this._keepBarItem);
         this.menu.addAction('Clear all', () => this._ext.ClearAll());
 
         // Rebuild the list every time the menu opens
@@ -173,6 +206,7 @@ class ScreenCoverIndicator extends PanelMenu.Button {
         for (const connector of connected)
             this._section.addMenuItem(this._makeRow(connector, details.get(connector)));
         this.sync();
+        this.syncOptions();
     }
 
     _makeRow(connector, detail) {
@@ -222,6 +256,11 @@ class ScreenCoverIndicator extends PanelMenu.Button {
             freeze.checked = mode === 'freeze';
         }
     }
+
+    /** Make the option switches reflect the current config. */
+    syncOptions() {
+        this._keepBarItem.setToggleState(this._ext.keepTopBar);
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -231,9 +270,11 @@ class ScreenCoverIndicator extends PanelMenu.Button {
 export default class ScreenCoverExtension extends Extension {
     enable() {
         this._covers = new Map(); // connector -> {actor, mode}
+        // Must be loaded before the indicator is created
+        this._config = {keepTopBar: false, ...loadConfig(this.uuid)};
 
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
-        this._dbus.export(Gio.DBus.session, '/dev/romen/ScreenCover');
+        this._dbus.export(Gio.DBus.session, DBUS_PATH);
 
         this._indicator = new Indicator(this);
         Main.panel.addToStatusArea(this.uuid, this._indicator);
@@ -254,11 +295,28 @@ export default class ScreenCoverExtension extends Extension {
         this._dbus.unexport();
         this._dbus = null;
         this._covers = null;
+        this._config = null;
     }
+
+    // ----- State -----
 
     modeOf(connector) {
         return this._covers?.get(connector)?.mode ?? null;
     }
+
+    get keepTopBar() {
+        return Boolean(this._config?.keepTopBar);
+    }
+
+    setKeepTopBar(keep) {
+        this._config.keepTopBar = Boolean(keep);
+        saveConfig(this.uuid, this._config);
+        for (const {actor} of this._covers.values())
+            this._restack(actor);
+        this._indicator?.syncOptions();
+    }
+
+    // ----- Covers -----
 
     _monitor(connector) {
         const idx = global.backend.get_monitor_manager()
@@ -266,6 +324,15 @@ export default class ScreenCoverExtension extends Extension {
         if (idx < 0)
             throw new Error(`No monitor with connector ${connector}`);
         return Main.layoutManager.monitors[idx];
+    }
+
+    /** Place a cover above or below the top bar, per the keepTopBar option. */
+    _restack(actor) {
+        const group = Main.layoutManager.uiGroup;
+        if (this.keepTopBar)
+            group.set_child_below_sibling(actor, Main.layoutManager.panelBox);
+        else
+            group.set_child_below_sibling(actor, global.top_window_group);
     }
 
     _addCover(connector, mode, mon) {
@@ -281,7 +348,9 @@ export default class ScreenCoverExtension extends Extension {
                 this.Clear(connector);
             return Clutter.EVENT_STOP;
         });
+
         Main.layoutManager.addTopChrome(actor, {affectsInputRegion: true});
+        this._restack(actor);
         this._covers.set(connector, {actor, mode});
         this._indicator?.sync();
         return actor;
@@ -367,5 +436,9 @@ export default class ScreenCoverExtension extends Extension {
             return;
         for (const connector of [...this._covers.keys()])
             this.Clear(connector);
+    }
+
+    SetKeepTopBar(keep) {
+        this.setKeepTopBar(keep);
     }
 }
